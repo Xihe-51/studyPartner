@@ -171,9 +171,16 @@ onMounted(load)
         class="mt-2 rounded px-3 py-2 text-[11px]"
         :class="question.judge_summary.status === 'accepted'
           ? 'bg-emerald-50/70 text-emerald-700 dark:bg-emerald-950/20 dark:text-emerald-300'
-          : 'bg-amber-50/70 text-amber-700 dark:bg-amber-950/20 dark:text-amber-300'"
+          : question.judge_summary.status === 'no_answer'
+            ? 'bg-gray-50 text-gray-500 dark:bg-zinc-900/60 dark:text-zinc-400'
+            : 'bg-amber-50/70 text-amber-700 dark:bg-amber-950/20 dark:text-amber-300'"
       >
-        测试用例通过 {{ question.judge_summary.passed }} / {{ question.judge_summary.total }}（{{ judgeStatusLabel(question.judge_summary.status) }}）
+        <template v-if="question.judge_summary.status === 'no_answer'">
+          这道题没有提交代码
+        </template>
+        <template v-else>
+          测试用例通过 {{ question.judge_summary.passed }} / {{ question.judge_summary.total }}（{{ judgeStatusLabel(question.judge_summary.status) }}）
+        </template>
       </div>
 
       <div class="mt-2 rounded bg-emerald-50/70 px-3 py-2 dark:bg-emerald-950/20">

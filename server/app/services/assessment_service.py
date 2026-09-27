@@ -1987,14 +1987,18 @@ class AssessmentService:
             q = qmap.get(qid)
             if not q:
                 continue
-            correct = AssessmentService._judge(q, a.get("answer"))
+            # 编程题的起始代码是系统预填的。学生没动过就提交时，前端会把这段
+            # 骨架原样带上来 —— 存成答案的话，教师看到的是「写了段错代码」，
+            # 而学生其实一行没碰；判题也会报「输出不符」而不是「未作答」。
+            answer_value = AssessmentService._strip_untouched_starter(q, a.get("answer"))
+            correct = AssessmentService._judge(q, answer_value)
             # 没设分值的题不能「自动判对但给 0 分」——那等于把学生判错。
             # 保持未批改，连同主观题一起进批改队列，等教师补分值并给分。
             graded = q.question_type in ("single", "multiple", "judge", "fill") and q.score is not None
             awarded = float(q.score or 0.0) if correct else 0.0
             row = existing.get(qid)
             if row:
-                row.answer = a.get("answer")
+                row.answer = answer_value
                 row.is_correct = correct
                 row.score = awarded
                 row.graded = graded
@@ -2003,12 +2007,28 @@ class AssessmentService:
                     AssessmentAnswer(
                         attempt_id=attempt.id,
                         question_id=qid,
-                        answer=a.get("answer"),
+                        answer=answer_value,
                         is_correct=correct,
                         score=awarded,
                         graded=graded,
                     )
                 )
+
+    @staticmethod
+    def _strip_untouched_starter(question: AssessmentQuestion, answer: Any) -> Any:
+        """编程题提交内容与起始代码完全一致时，视为未作答（返回 None）。
+
+        前端会给编程题预填起始代码，学生一行不改也会把它带上来。不做归一的话
+        教师看到的是「写了段错代码」，判题报「输出不符」，而学生实际什么都没做。
+        """
+        if question.question_type != "code" or not answer:
+            return answer
+        starter = (question.starter_code or "").strip()
+        if not starter:
+            return answer
+        if not isinstance(answer, str):
+            return answer
+        return None if answer.strip() == starter else answer
 
     @staticmethod
     async def _load_student_attempt(

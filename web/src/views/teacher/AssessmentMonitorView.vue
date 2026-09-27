@@ -833,9 +833,13 @@ onMounted(loadPapers)
               class="rounded px-2 py-0.5 text-[10px] font-semibold"
               :class="a.judge_summary.status === 'accepted'
                 ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/30 dark:text-emerald-400'
-                : 'bg-red-50 text-red-500 dark:bg-red-950/30 dark:text-red-400'"
+                : a.judge_summary.status === 'no_answer'
+                  ? 'bg-gray-100 text-gray-500 dark:bg-zinc-800 dark:text-zinc-400'
+                  : 'bg-red-50 text-red-500 dark:bg-red-950/30 dark:text-red-400'"
             >
-              用例 {{ a.judge_summary.passed }}/{{ a.judge_summary.total }}
+              <!-- 未提交时不能显示「用例 0/1」：那读起来像答错了，实际是整题空着 -->
+              <template v-if="a.judge_summary.status === 'no_answer'">未提交代码</template>
+              <template v-else>用例 {{ a.judge_summary.passed }}/{{ a.judge_summary.total }}</template>
             </span>
           </div>
 
