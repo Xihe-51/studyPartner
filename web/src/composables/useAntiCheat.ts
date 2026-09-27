@@ -205,11 +205,36 @@ export function useAntiCheat(options: { maxFullscreenExits?: number; enforceFull
     }
   }
 
+  // 「框选题干」不能只看 selectstart：普通点击也会触发它，实测一次 20 秒的作答
+  // 里点一下就记一条，106 次违规全是正常点击 —— 每个学生都被标成可疑，违规计数
+  // 直接失去意义。所以这里不拦 selectstart，改在鼠标松开时看有没有真的选出一段
+  // 文字。复制、剪切、拖拽仍由各自的处理器拦着，短暂高亮不构成泄露。
   const onSelectStart = (e: Event) => {
     const el = e.target as HTMLElement | null
     const tag = el && el.tagName
+    // 输入框里选中的是自己写的字，属于正常编辑
     if (tag === 'TEXTAREA' || tag === 'INPUT') return
-    preventAndFlag(e, 'blocked_selection', {})
+  }
+
+  const commitBlockedSelection = () => {
+    const selection = document.getSelection()
+    if (!selection) return
+    const text = selection.toString().trim()
+    if (!text) return
+    // 选中区域如果落在输入框内，是学生在改自己的答案，不算违规
+    const anchor = selection.anchorNode?.parentElement
+    const anchorTag = anchor?.tagName
+    if (anchorTag === 'TEXTAREA' || anchorTag === 'INPUT') return
+    recordViolation()
+    push('blocked_selection', { length: text.length })
+    selection.removeAllRanges()
+  }
+
+  const onMouseUp = (e: MouseEvent) => {
+    const el = e.target as HTMLElement | null
+    const tag = el && el.tagName
+    if (tag === 'TEXTAREA' || tag === 'INPUT') return
+    commitBlockedSelection()
   }
 
   const onDragStart = (e: Event) => {
@@ -478,10 +503,17 @@ export function useAntiCheat(options: { maxFullscreenExits?: number; enforceFull
     focusState = null
   }
 
-  const commitFocusDwell = () => {
+  /**
+   * 落一条焦点停留记录。
+   *
+   * minMs 给心跳用：累计不足 minMs 时**不重置计时**，继续攒下一次，
+   * 否则等于把这段时间丢掉。切焦点这类真实边界传 0，立刻落。
+   */
+  const commitFocusDwell = (minMs = 0) => {
     if (!focusState) return
     const now = ts()
     const durationMs = now - focusState.startedAt
+    if (durationMs < minMs) return
     focusState.startedAt = now
     if (durationMs >= 300) {
       push('focus_dwell', {
@@ -516,9 +548,11 @@ export function useAntiCheat(options: { maxFullscreenExits?: number; enforceFull
     return best
   }
 
-  const commitQuestionDwell = () => {
+  /** 同 commitFocusDwell：minMs 给心跳用，累计不够就不重置、继续攒。 */
+  const commitQuestionDwell = (minMs = 0) => {
     if (currentQuestion == null || questionStartedAt == null) return
     const durationMs = ts() - questionStartedAt
+    if (durationMs < minMs) return
     questionStartedAt = ts()
     if (durationMs >= 1000) {
       push('question_dwell', { question_id: currentQuestion, duration_ms: durationMs })
@@ -604,9 +638,13 @@ export function useAntiCheat(options: { maxFullscreenExits?: number; enforceFull
     }
   }
 
+  // 心跳只做两件事：把攒够一段时间的停留落成事件（防浏览器崩溃丢数据），
+  // 以及让会话保持活跃。粒度过细会把长考试的事件表撑爆 —— 6 秒一条意味着
+  // 一小时 600 条，长卷监考页要一次拉全量，直接被拖慢。
+  const HEARTBEAT_COMMIT_MS = 60_000
   const onHeartbeat = () => {
-    commitFocusDwell()
-    commitQuestionDwell()
+    commitFocusDwell(HEARTBEAT_COMMIT_MS)
+    commitQuestionDwell(HEARTBEAT_COMMIT_MS)
   }
 
   const startTracking = (sid: string, aid: string | null, callbacks: AntiCheatCallbacks) => {
@@ -630,6 +668,7 @@ export function useAntiCheat(options: { maxFullscreenExits?: number; enforceFull
     document.addEventListener('compositionstart', onCompositionStart, true)
     document.addEventListener('compositionend', onCompositionEnd, true)
     document.addEventListener('selectstart', onSelectStart, true)
+    document.addEventListener('mouseup', onMouseUp, true)
     document.addEventListener('dragstart', onDragStart, true)
     document.addEventListener('fullscreenchange', onFullscreenChange)
     window.addEventListener('focus', onFocus)
@@ -700,6 +739,7 @@ export function useAntiCheat(options: { maxFullscreenExits?: number; enforceFull
     document.removeEventListener('compositionstart', onCompositionStart, true)
     document.removeEventListener('compositionend', onCompositionEnd, true)
     document.removeEventListener('selectstart', onSelectStart, true)
+    document.removeEventListener('mouseup', onMouseUp, true)
     document.removeEventListener('dragstart', onDragStart, true)
     document.removeEventListener('fullscreenchange', onFullscreenChange)
     window.removeEventListener('focus', onFocus)
