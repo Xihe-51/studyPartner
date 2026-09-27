@@ -518,13 +518,25 @@ const load = async () => {
   }
 }
 
+// 已用时以服务端记录的 started_at 为准。
+// 只按页面停留累加的话，学生刷新一次计时就归零 —— 他看着「已用时 00:00」，
+// 实际已经用掉半小时，而最终时长是按 started_at 算的，两处对不上。
+const syncElapsed = () => {
+  const started = attempt.value?.started_at
+  if (!started) return
+  const began = new Date(started).getTime()
+  if (Number.isNaN(began)) return
+  elapsedSeconds.value = Math.max(0, Math.floor((Date.now() - began) / 1000))
+}
+
 onMounted(async () => {
   await load()
   // load 期间可能已经切走；此时 onUnmounted 早已跑完，再建 interval 就没人清了。
   if (unmounted) return
+  syncElapsed()
   if (!submitted.value) tickCountdown()
   timer = window.setInterval(() => {
-    if (!submitted.value && started.value) elapsedSeconds.value += 1
+    if (!submitted.value && started.value) syncElapsed()
   }, 1000)
   countdownTimer = window.setInterval(tickCountdown, 1000)
 })
