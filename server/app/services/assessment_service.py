@@ -5,7 +5,7 @@ import logging
 import math
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import UUID
 
 from sqlalchemy import delete, func, or_, select
@@ -868,6 +868,41 @@ class AssessmentService:
     SCORE_BUCKETS = [(0, 60, "不及格"), (60, 70, "及格"), (70, 80, "中等"), (80, 90, "良好"), (90, 101, "优秀")]
 
     @staticmethod
+    def average_dwell_per_question(rows: Iterable[Tuple[Any, Any]]) -> Dict[str, float]:
+        """把 (attempt_id, payload) 形式的 question_dwell 事件聚成逐题平均停留秒数。
+
+        同一名学生同一道题会落多条 dwell —— 心跳每 60 秒就给当前题提交一条 ——
+        所以必须先按 (作答, 题目) 汇总成「这人这题一共停留多久」，再对人数取平均。
+        直接拿「总时长 / 事件数」会被段数摊薄：在同一道题上停留越久，落的事件越多，
+        算出来反而越短。行为事件分布那类按事件计数的统计不受影响，这里是唯一
+        需要先合并再平均的地方。
+        """
+        per_attempt: Dict[Tuple[str, str], int] = {}
+        for attempt_id, payload in rows:
+            if not payload:
+                continue
+            qid = payload.get("question_id")
+            ms = payload.get("duration_ms")
+            if not qid or ms is None:
+                continue
+            try:
+                ms_val = int(ms)
+            except (TypeError, ValueError):
+                continue
+            key = (str(attempt_id), str(qid))
+            per_attempt[key] = per_attempt.get(key, 0) + ms_val
+
+        per_question: Dict[str, List[int]] = {}
+        for (_, qid), total_ms in per_attempt.items():
+            per_question.setdefault(qid, []).append(total_ms)
+
+        return {
+            qid: round(sum(totals) / len(totals) / 1000, 1)
+            for qid, totals in per_question.items()
+            if totals
+        }
+
+    @staticmethod
     async def get_paper_analytics(
         db: AsyncSession, paper_id: UUID, teacher_id: UUID
     ) -> Dict[str, Any]:
@@ -910,8 +945,16 @@ class AssessmentService:
             pass_line = total_score * 0.6
             pass_rate = round(sum(1 for s in scores if s >= pass_line) / len(scores) * 100, 1)
 
+        # 「应考人数」是发布名单，不是「已经开考的人数」。拿 attempts 当分母时，
+        # 全班 40 人只有 5 人开考会显示成「已作答 3 / 5 人」，看着像只发了 5 份，
+        # 而且分母会随学生陆续开考自己长大（最后几个人开考时甚至显示 100%）。
+        # 名单取不到（老数据没有 publish_target）时退化成已开考人数；再并入发布
+        # 范围外的作答者，保证分母不会小于分子。
+        assigned_ids = set(await AssessmentService._roster_student_ids(db, paper))
+        assigned_ids |= {a.student_id for a in attempts}
+
         overview = {
-            "assigned": len(attempts),
+            "assigned": len(assigned_ids),
             "finished": len(finished),
             "in_progress": sum(1 for a in attempts if a.status == "in_progress"),
             "pending_review": sum(1 for a in attempts if a.status == "pending_review"),
@@ -996,34 +1039,19 @@ class AssessmentService:
         # GROUP BY 里会被绑定成两个不同的占位符（$1 vs $4），Postgres 判定
         # 「不是同一个表达式」而报 GroupingError。每份试卷的 dwell 事件量很小
         # （题数 × 作答数），拉回来算完全够用。
-        dwell_totals: Dict[str, int] = {}
-        dwell_counts: Dict[str, int] = {}
+        dwell_rows: List[Tuple[Any, Any]] = []
         if attempt_ids:
-            dwell_rows = await db.execute(
-                select(BehaviorEvent.payload).where(
-                    BehaviorEvent.attempt_id.in_(attempt_ids),
-                    BehaviorEvent.event_type == "question_dwell",
-                )
+            dwell_rows = list(
+                (
+                    await db.execute(
+                        select(BehaviorEvent.attempt_id, BehaviorEvent.payload).where(
+                            BehaviorEvent.attempt_id.in_(attempt_ids),
+                            BehaviorEvent.event_type == "question_dwell",
+                        )
+                    )
+                ).all()
             )
-            for (payload,) in dwell_rows.all():
-                if not payload:
-                    continue
-                qid = payload.get("question_id")
-                ms = payload.get("duration_ms")
-                if not qid or ms is None:
-                    continue
-                try:
-                    ms_val = int(ms)
-                except (TypeError, ValueError):
-                    continue
-                dwell_totals[qid] = dwell_totals.get(qid, 0) + ms_val
-                dwell_counts[qid] = dwell_counts.get(qid, 0) + 1
-
-        dwell_map: Dict[str, float] = {
-            qid: round(total / dwell_counts[qid] / 1000, 1)
-            for qid, total in dwell_totals.items()
-            if dwell_counts.get(qid)
-        }
+        dwell_map = AssessmentService.average_dwell_per_question(dwell_rows)
 
         for stat in question_stats:
             stat["avg_dwell_seconds"] = dwell_map.get(stat["question_id"])
@@ -1140,28 +1168,20 @@ class AssessmentService:
                 )
             ).scalars().all()
         ]
-        class_dwell_sum: Dict[str, int] = {}
-        class_dwell_cnt: Dict[str, int] = {}
+        class_dwell_rows: List[Tuple[Any, Any]] = []
         if all_attempt_ids:
-            rows = await db.execute(
-                select(BehaviorEvent.payload).where(
-                    BehaviorEvent.attempt_id.in_(all_attempt_ids),
-                    BehaviorEvent.event_type == "question_dwell",
-                )
+            class_dwell_rows = list(
+                (
+                    await db.execute(
+                        select(BehaviorEvent.attempt_id, BehaviorEvent.payload).where(
+                            BehaviorEvent.attempt_id.in_(all_attempt_ids),
+                            BehaviorEvent.event_type == "question_dwell",
+                        )
+                    )
+                ).all()
             )
-            for (payload,) in rows.all():
-                if not payload:
-                    continue
-                qid = payload.get("question_id")
-                ms = payload.get("duration_ms")
-                if not qid or ms is None:
-                    continue
-                try:
-                    ms_val = int(ms)
-                except (TypeError, ValueError):
-                    continue
-                class_dwell_sum[qid] = class_dwell_sum.get(qid, 0) + ms_val
-                class_dwell_cnt[qid] = class_dwell_cnt.get(qid, 0) + 1
+        # 班级均值同样要先按 (作答, 题目) 合并，否则被心跳分段摊薄
+        class_dwell_map = AssessmentService.average_dwell_per_question(class_dwell_rows)
 
         # 本次作答的全部事件
         events = (
@@ -1238,10 +1258,8 @@ class AssessmentService:
 
         for qid, stat in per_q.items():
             stat["dwell_seconds"] = round(stat["dwell_seconds"], 1)
-            if class_dwell_cnt.get(qid):
-                stat["class_avg_dwell_seconds"] = round(
-                    class_dwell_sum[qid] / class_dwell_cnt[qid] / 1000, 1
-                )
+            if qid in class_dwell_map:
+                stat["class_avg_dwell_seconds"] = class_dwell_map[qid]
 
         return {
             "attempt": {
