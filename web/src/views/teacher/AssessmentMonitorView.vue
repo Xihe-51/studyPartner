@@ -285,8 +285,12 @@ const exportScoreSheet = async () => {
     const encoded = /filename\*=UTF-8''([^;]+)/.exec(res.headers?.['content-disposition'] || '')
     link.href = url
     link.download = encoded ? decodeURIComponent(encoded[1]) : '成绩单.pdf'
+    // 锚点必须挂进文档再点：游离节点在 Firefox 上不触发下载。
+    // 也不能点完立刻 revoke —— 那会让还没开始的下载被掐掉，延迟回收即可。
+    document.body.appendChild(link)
     link.click()
-    URL.revokeObjectURL(url)
+    document.body.removeChild(link)
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
   } catch {
     // 错误已由拦截器提示
   } finally {
@@ -596,17 +600,21 @@ onMounted(loadPapers)
         <el-table-column label="提交时间" width="160">
           <template #default="{ row }">{{ formatTime(row.submitted_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="170" fixed="right">
+        <el-table-column label="操作" width="200" fixed="right">
           <template #default="{ row }">
+            <!-- 已交卷就要能打开：编程题全用例通过时会自动满分、待批数归零，
+                 只按待批数显示的话，教师再也看不到学生代码与判题明细，
+                 也没法覆盖那道自动给的分。 -->
             <el-button
-              v-if="row.pending_grade_count > 0"
+              v-if="row.status !== 'in_progress'"
               size="small"
               text
-              type="warning"
+              :type="row.pending_grade_count > 0 ? 'warning' : 'info'"
               :icon="PenLine"
               @click="openGrading(row)"
             >
-              批改 ({{ row.pending_grade_count }})
+              <template v-if="row.pending_grade_count > 0">批改 ({{ row.pending_grade_count }})</template>
+              <template v-else>查看/批改</template>
             </el-button>
             <el-button size="small" text type="primary" :icon="Eye" @click="openBehavior(row)">
               作答画像

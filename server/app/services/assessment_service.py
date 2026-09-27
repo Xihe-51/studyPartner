@@ -2389,7 +2389,6 @@ class AssessmentService:
                     "passed": case.passed,
                     "status": case.status,
                     "input": case.input_text,
-                    "expected_output": case.expected,
                     "actual_output": case.actual,
                     "stderr": case.stderr,
                     "time_ms": case.time_ms,

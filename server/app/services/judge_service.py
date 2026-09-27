@@ -313,11 +313,12 @@ def judge_code(
 
 @dataclass
 class DryRunCase:
+    """自测的一次运行结果。没有期望输出，passed 恒为 None。"""
+
     index: int
-    passed: Optional[bool]  # None = 自定义输入，没有期望输出可比较
+    passed: Optional[bool]
     status: str
     input_text: str = ""
-    expected: str = ""
     actual: str = ""
     stderr: str = ""
     time_ms: Optional[int] = None
@@ -368,10 +369,9 @@ def dry_run(
     cases = [
         DryRunCase(
             index=0,
-            passed=None,  # 没有期望输出可比，只说跑成没跑成
+            passed=None,  # 自测不比对期望值，跑成没跑成只看 status
             status=state,
             input_text=stdin_text or "",
-            expected="",
             actual=(raw.get("stdout") or "")[:4000],
             stderr=(raw.get("stderr") or "")[:2000],
             time_ms=raw.get("time_ms"),

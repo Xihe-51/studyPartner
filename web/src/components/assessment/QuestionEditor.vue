@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { Plus, Trash2 } from 'lucide-vue-next'
 import RichStem from './RichStem.vue'
 
@@ -33,6 +33,18 @@ const testCases = computed<any[]>(() => {
   if (!Array.isArray(props.item.test_cases)) props.item.test_cases = []
   return props.item.test_cases
 })
+
+// 切换成编程题时把语言补上默认值。不补的话下拉框看着选了「Python 3」，
+// 实际 model 是 undefined，提交时与界面显示不一致。
+watch(
+  () => props.item.question_type,
+  (type) => {
+    if (type === 'code' && !props.item.language) {
+      props.item.language = 'python'
+    }
+  },
+  { immediate: true }
+)
 
 function addTestCase() {
   if (!Array.isArray(props.item.test_cases)) props.item.test_cases = []

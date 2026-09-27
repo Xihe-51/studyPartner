@@ -26,6 +26,7 @@ import { assessmentApi } from '../../api/modules/assessment'
 import { learningPathApi } from '../../api/modules/learning_path'
 import { userApi } from '../../api/modules/user'
 import { useAuthStore } from '../../stores/auth'
+import { toQuestionSavePayload } from '../../utils/questionSavePayload'
 
 const activeStep = ref(0)
 const title = ref('')
@@ -472,19 +473,7 @@ async function saveAndNext() {
   try {
     await assessmentApi.saveQuestions(
       paperId.value,
-      questions.value.map((q) => ({
-        question_type: q.question_type,
-        stem: q.stem,
-        stem_images: q.stem_images,
-        options: q.options,
-        answer: q.answer,
-        analysis: q.analysis,
-        // undefined 与 null 都表示「未设置分值」，统一成 null 发给后端
-        score: q.score ?? null,
-        difficulty: q.difficulty,
-        tags: q.tags,
-        source_chunk: q.source_chunk
-      }))
+      toQuestionSavePayload(questions.value)
     )
     ElMessage.success('题目已保存')
     activeStep.value = 3

@@ -153,11 +153,13 @@ class CodeRunReq(BaseModel):
 
 
 class CodeRunCaseOut(BaseModel):
+    """自测结果。没有期望输出可比，所以只有实际输出。"""
+
     index: int
+    # 恒为 None：自测不比对期望值，保留字段只为兼容前端已有的判空逻辑
     passed: Optional[bool] = None
     status: str
     input: str = ""
-    expected_output: str = ""
     actual_output: str = ""
     stderr: str = ""
     time_ms: Optional[int] = None
