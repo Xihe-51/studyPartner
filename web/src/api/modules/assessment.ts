@@ -134,6 +134,8 @@ export interface QuestionStat {
   order_index: number
   question_type: string
   answered: number
+  /** 已批改份数。主观题只按已批改的算得分率，与 answered 不等时要让教师看见 */
+  graded: number
   correct: number | null
   accuracy: number | null
   avg_score_rate: number | null

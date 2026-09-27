@@ -354,10 +354,20 @@ onMounted(loadPapers)
                   >
                     <td class="py-2 pr-4 font-semibold">{{ q.order_index + 1 }}</td>
                     <td class="py-2 pr-4">{{ q.question_type }}</td>
-                    <td class="py-2 pr-4">{{ q.answered }}</td>
+                    <td class="py-2 pr-4">
+                      {{ q.answered }}
+                      <!-- 主观题只按已批改的算得分率，得说清这个比例是对谁算的 -->
+                      <span
+                        v-if="q.graded != null && q.graded < q.answered"
+                        class="ml-1 text-[10px] text-amber-600 dark:text-amber-400"
+                      >
+                        已批 {{ q.graded }}
+                      </span>
+                    </td>
                     <td class="py-2 pr-4">
                       <span v-if="q.accuracy != null">{{ q.accuracy }}%</span>
                       <span v-else-if="q.avg_score_rate != null">{{ q.avg_score_rate }}%（得分率）</span>
+                      <span v-else-if="q.answered > 0" class="text-amber-600 dark:text-amber-400">待批改</span>
                       <span v-else class="text-gray-300 dark:text-zinc-600">—</span>
                     </td>
                     <td class="py-2 pr-4">

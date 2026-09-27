@@ -967,20 +967,25 @@ class AssessmentService:
                     "order_index": q.order_index,
                     "question_type": q.question_type,
                     "answered": answered,
+                    "graded": sum(1 for a in rows if a.graded),
                     "correct": correct,
                     "accuracy": rate,
                     "avg_score_rate": None,
                 })
             else:
-                max_total = sum(float(a.score or 0.0) for a in rows)
+                # 只统计已批改的：未批的答案 score 还是 0，算进去会让这道题显示成
+                # 「得分率 0%」，教师以为全班都不会，其实只是还没批。
+                graded_rows = [a for a in rows if a.graded]
+                graded_total = sum(float(a.score or 0.0) for a in graded_rows)
                 # 主观题满分按题分值算，未设分值时无法算得分率
-                possible = float(q.score) * answered if q.score is not None else None
-                rate = round(max_total / possible * 100, 1) if possible else None
+                possible = float(q.score) * len(graded_rows) if q.score is not None else None
+                rate = round(graded_total / possible * 100, 1) if possible else None
                 question_stats.append({
                     "question_id": str(q.id),
                     "order_index": q.order_index,
                     "question_type": q.question_type,
                     "answered": answered,
+                    "graded": len(graded_rows),
                     "correct": None,
                     "accuracy": None,
                     "avg_score_rate": rate,
