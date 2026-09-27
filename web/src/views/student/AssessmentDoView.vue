@@ -211,6 +211,34 @@ const reportEvents = (events: BehaviorEventPayload[]) => {
     .then(() => undefined)
 }
 
+/**
+ * 重新核对服务端的真实状态，用于交卷请求失败后的兜底。
+ *
+ * 判题慢于前端超时时，服务端其实已经结算完成，但本地还停在「未交卷」。
+ * 不重新核对的话，学生重试会撞「已交卷，不能重复提交」，界面却一直报失败。
+ * 返回 true 表示确实已交卷，本地状态已同步。
+ */
+const syncSubmittedState = async () => {
+  if (!attempt.value) return false
+  try {
+    const res = await assessmentApi.startAttempt(paperId)
+    const latest = res.data
+    if (!latest || (latest.status !== 'submitted' && latest.status !== 'pending_review')) {
+      return false
+    }
+    attempt.value = latest
+    result.value = latest
+    pendingReview.value = latest.status === 'pending_review'
+    submitted.value = true
+    started.value = false
+    antiCheat.stopTracking()
+    await antiCheat.exitFullscreen()
+    return true
+  } catch {
+    return false
+  }
+}
+
 const submit = async (auto = false) => {
   if (submitted.value) return false
   if (!attempt.value) {
@@ -241,6 +269,13 @@ const submit = async (auto = false) => {
     // 竞态：autosave 的服务端强制交卷先落地时，再交卷会撞「不能重复提交」。
     // 此时本地已被 autosave 的分支切到已交卷态，不该报错，也不该复位状态。
     if (submitted.value && result.value) return true
+    // 请求超时不代表没交上：判题可能比前端超时更久，服务端往往已经结算完成。
+    // 直接报「交卷失败」会让学生在重试时撞「已交卷，不能重复提交」，卡在错误里出不去。
+    const recovered = await syncSubmittedState()
+    if (recovered) {
+      ElMessage.info('试卷已提交')
+      return true
+    }
     submitted.value = false
     ElMessage.error(auto ? '自动交卷失败，请手动点击交卷' : '交卷失败，请重试')
     return false

@@ -441,7 +441,13 @@ export const assessmentApi = {
   },
 
   submitAttempt(attemptId: string, answers: StudentAnswerIn[]) {
-    return request.post(`/assessment/student/attempts/${attemptId}/submit`, { answers })
+    // 交卷时要在服务端同步跑完所有编程题的判题：每个超时的用例都会吃满 CPU 上限，
+    // 一份编程题较多的卷可能远超默认 30 秒。超时只断前端，服务端会做完结算。
+    return request.post(
+      `/assessment/student/attempts/${attemptId}/submit`,
+      { answers },
+      { timeout: 180_000 }
+    )
   },
 
   reportBehavior(data: {
