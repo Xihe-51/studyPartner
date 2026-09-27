@@ -43,6 +43,19 @@ def login(username, password):
     return d["data"]["access_token"]
 
 
+async def attempt_status(attempt_id):
+    """读一份作答的当前状态，用来判断是不是「别人已经先收过卷了」。"""
+    from app.core.database import SessionLocal
+    from app.models.assessment import AssessmentAttempt
+    from sqlalchemy import select
+
+    async with SessionLocal() as db:
+        row = (await db.execute(
+            select(AssessmentAttempt).where(AssessmentAttempt.id == uuid.UUID(attempt_id))
+        )).scalars().first()
+        return row.status if row else None
+
+
 async def seed(title, questions, **paper_kwargs):
     from app.core.database import SessionLocal
     from app.models.assessment import AssessmentPaper, AssessmentQuestion
@@ -136,10 +149,15 @@ async def run_all():
             row.started_at = datetime.now(timezone.utc) - timedelta(minutes=40)
             await db.commit()
 
+        # 本地开了 inline 调度器时，它可能已经先收过卷了；这时本次调用返回 0 也算正常，
+        # 真正要保证的是「最终确实被收卷」，而不是「必须是这一次调用动的手」。
+        before_status = await attempt_status(attempt_id)
         from app.services.assessment_service import AssessmentService
         async with SessionLocal() as db:
             finalized = await AssessmentService.finalize_expired_attempts(db)
-        check("限时过期被到点任务收卷", finalized >= 1, f"finalized={finalized}")
+        check("限时过期被到点任务收卷",
+              finalized >= 1 or before_status != "in_progress",
+              f"finalized={finalized} before={before_status}")
 
         _, after = call("GET", f"/assessment/papers/{pid}/attempts", teacher)
         row = next((a for a in after["data"] if a["id"] == attempt_id), None)
@@ -176,9 +194,12 @@ async def run_all():
             target["due_at"] = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
             row.publish_target = target
             await db.commit()
+        before_status = await attempt_status(attempt_id)
         async with SessionLocal() as db:
             finalized = await AssessmentService.finalize_expired_attempts(db)
-        check("截止时间过期被到点任务收卷", finalized >= 1, f"finalized={finalized}")
+        check("截止时间过期被到点任务收卷",
+              finalized >= 1 or before_status != "in_progress",
+              f"finalized={finalized} before={before_status}")
     finally:
         await cleanup(pid)
 

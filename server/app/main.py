@@ -85,7 +85,10 @@ async def health_check():
 async def startup_event():
     if settings.ENABLE_INLINE_SCHEDULER:
         from app.core.scheduler import start_scheduler
+        from app.core.task_dispatch import start_assessment_scheduler
         start_scheduler()
+        # 预约发布与到点收卷：生产由 celery beat 驱动，本地没有 beat 就在这里跑
+        start_assessment_scheduler()
 
     # 无 Celery worker 时拆题任务跑在本进程内，重启会把它连同状态一起丢掉，
     # 试卷永久停在 parsing。启动时兜底把这类试卷重新派发一次。
@@ -108,7 +111,9 @@ async def startup_event():
 async def shutdown_event():
     if settings.ENABLE_INLINE_SCHEDULER:
         from app.core.scheduler import stop_scheduler
+        from app.core.task_dispatch import stop_assessment_scheduler
         stop_scheduler()
+        await stop_assessment_scheduler()
 
 # Include the API router
 app.include_router(api_router, prefix="/api/v1")
