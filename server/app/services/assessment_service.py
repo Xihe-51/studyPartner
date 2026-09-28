@@ -379,16 +379,20 @@ class AssessmentService:
 
         # 有题目没设分值就发布，学生端会看到「满分未知」，客观题也无法自动判分。
         # 这是教师校对时漏填，属于可修的错误，必须在发布前拦下来。
+        # 0 分同样拦：历史数据里「原文没标分值」曾落成 0，不能拿 0 冒充没设分值。
         missing = await db.execute(
             select(func.count(AssessmentQuestion.id)).where(
                 AssessmentQuestion.paper_id == paper_id,
-                AssessmentQuestion.score.is_(None),
+                or_(
+                    AssessmentQuestion.score.is_(None),
+                    AssessmentQuestion.score <= 0,
+                ),
             )
         )
         missing_count = missing.scalar() or 0
         if missing_count:
             raise ValidationError(
-                f"还有 {missing_count} 道题未设置分值，请返回校对页填写后再发布"
+                f"还有 {missing_count} 道题未设置分值（或分值为 0），请返回校对页填写后再发布"
             )
 
         raw_target = dict(publish_target or {})
