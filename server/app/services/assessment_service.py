@@ -27,7 +27,7 @@ from app.models.learning_path import ClassGroup, ClassMember
 from app.models.user import StudentProfile, User
 from app.services.minio_service import MinioService
 from app.services import question_parser as question_parser_module
-from app.utils.parser import extract_images, parse_document
+from app.utils.parser import extract_images, parse_document, parse_document_with_images
 
 IMG_RE = re.compile(r"\[\[IMG:(\d+)\]\]")
 
@@ -401,16 +401,31 @@ class AssessmentService:
 
         target = dict(raw_target)
         try:
+            raw_whitelist = target.get("whitelist") or []
+            raw_blacklist = target.get("blacklist") or []
+            raw_subset = target.get("student_ids") or []
             whitelist = await AssessmentService._resolve_student_identifiers(
-                db, target.get("whitelist") or [], teacher_id
+                db, raw_whitelist, teacher_id
             )
             blacklist = await AssessmentService._resolve_student_identifiers(
-                db, target.get("blacklist") or [], teacher_id
+                db, raw_blacklist, teacher_id
             )
             subset = await AssessmentService._resolve_student_identifiers(
-                db, target.get("student_ids") or [], teacher_id
+                db, raw_subset, teacher_id
             )
 
+            # 填了却一个都没解析出来，说明这些学生都不在教师所带班级里。以前这里
+            # 静默 pop：老师以为白名单 / 指定学生生效了，实际全被丢掉，试卷发给了
+            # 计划外的对象。现在直接报错，让老师能当场发现并重填。
+            if raw_whitelist and not whitelist:
+                raise ValidationError("白名单里的学生都不在你所带班级中，请核对学号 / 用户名后重填")
+            if raw_blacklist and not blacklist:
+                raise ValidationError("黑名单里的学生都不在你所带班级中，请核对学号 / 用户名后重填")
+            if raw_subset and not subset:
+                raise ValidationError("指定的学生都不在你所带班级中，请重新选择")
+
+            # 解析为空时仍要 pop 掉：保留原始值的话 _is_targeted 会拿未解析的 ID
+            # 做字符串比对，把试卷发给其他教师班级的学生。
             if whitelist:
                 target["whitelist"] = whitelist
             else:
@@ -419,21 +434,29 @@ class AssessmentService:
                 target["blacklist"] = blacklist
             else:
                 target.pop("blacklist", None)
-            # 解析为空说明这些学生全都不在当前教师班内，必须 pop 掉：
-            # 保留原始值的话 _is_targeted 会拿未解析的 ID 做字符串比对，
-            # 把试卷发给其他教师班级的学生。
             if subset:
                 target["student_ids"] = subset
             else:
                 target.pop("student_ids", None)
 
             ttype = str(target.get("type") or "").strip()
-            if ttype == "student":
+            # mentor = 按指导学生，老师从学生列表里逐个挑的，不再受班级范围限制；
+            # student = 手填学号 / 用户名 / ID，仍要求是自己班级的 active 成员。
+            if ttype in ("student", "mentor"):
                 resolved_ids = await AssessmentService._resolve_student_identifiers(
-                    db, target.get("ids") or [], teacher_id
+                    db,
+                    target.get("ids") or [],
+                    teacher_id,
+                    restrict_to_own=(ttype == "student"),
                 )
                 if not resolved_ids:
-                    raise ValidationError("未匹配到任何有效学生，请检查学号 / 用户名 / 学生 ID")
+                    if ttype == "student":
+                        raise ValidationError(
+                            "未匹配到任何有效学生。请确认学号 / 用户名 / 学生 ID 填写正确，"
+                            "且该生是你所带班级的 active 成员；若该生不在你的班级里，"
+                            "请改用「按指导学生」发布"
+                        )
+                    raise ValidationError("未匹配到任何有效学生，请重新选择指导学生")
                 target["ids"] = resolved_ids
             elif ttype == "class":
                 raw_class_ids = AssessmentService._to_uuid_list(target.get("ids") or [])
@@ -844,7 +867,7 @@ class AssessmentService:
                     continue
                 ordered.append(uid)
 
-        if ttype == "student":
+        if ttype in ("student", "mentor"):
             add(AssessmentService._to_uuid_list(target.get("ids")))
         else:
             class_ids = AssessmentService._to_uuid_list(target.get("ids"))
@@ -1105,7 +1128,13 @@ class AssessmentService:
 
     @staticmethod
     async def list_attempt_behavior(
-        db: AsyncSession, attempt_id: UUID, teacher_id: UUID
+        db: AsyncSession,
+        attempt_id: UUID,
+        teacher_id: UUID,
+        event_type: Optional[str] = None,
+        question_id: Optional[str] = None,
+        offset: int = 0,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         result = await db.execute(
             select(AssessmentAttempt).where(AssessmentAttempt.id == attempt_id)
@@ -1121,11 +1150,18 @@ class AssessmentService:
         if not paper or paper.creator_id != teacher_id:
             raise NotFoundError("试卷不存在")
 
-        event_result = await db.execute(
-            select(BehaviorEvent)
-            .where(BehaviorEvent.attempt_id == attempt_id)
-            .order_by(BehaviorEvent.created_at.asc())
-        )
+        # 画像是「全量聚合」，但展开某题的编辑明细只需要那一道题的 answer_edit。
+        # 一次把整份事件拉进抽屉，长卷能到上千条，所以这里支持按类型 / 按题分页。
+        stmt = select(BehaviorEvent).where(BehaviorEvent.attempt_id == attempt_id)
+        if event_type:
+            stmt = stmt.where(BehaviorEvent.event_type == event_type)
+        if question_id:
+            stmt = stmt.where(BehaviorEvent.payload["question_id"].astext == question_id)
+        stmt = stmt.order_by(BehaviorEvent.created_at.asc()).offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+
+        event_result = await db.execute(stmt)
         events = event_result.scalars().all()
         return [
             {
@@ -1683,7 +1719,10 @@ class AssessmentService:
 
     @staticmethod
     async def _resolve_student_identifiers(
-        db: AsyncSession, values: List[Any], teacher_id: Optional[UUID] = None
+        db: AsyncSession,
+        values: List[Any],
+        teacher_id: Optional[UUID] = None,
+        restrict_to_own: bool = True,
     ) -> List[str]:
         if isinstance(values, str):
             values = [values]
@@ -1722,8 +1761,12 @@ class AssessmentService:
                 seen.add(str(match.id))
                 resolved.append(str(match.id))
 
-        # 限定为自己班级的学生，避免教师把试卷指派给非本班学生
-        if teacher_id is not None and resolved:
+        # 「按学生（手填 学号 / 用户名 / ID）」要求必须是教师自己班级的 active 成员，
+        # 避免把试卷指派给非本班学生。以前这里无条件过滤：学号明明填对了，只要该生
+        # 不在教师名下任何班级里就被静默剔除，最后报「未匹配到任何有效学生」，老师
+        # 对着正确的学号完全看不出问题在哪。「按指导学生」是教师从学生列表里逐个
+        # 挑的，改由调用方传 restrict_to_own=False 放行。
+        if teacher_id is not None and resolved and restrict_to_own:
             own = await AssessmentService._own_student_ids(db, teacher_id, resolved)
             resolved = [sid for sid in resolved if sid in own]
         return resolved
@@ -1749,7 +1792,7 @@ class AssessmentService:
             return False
 
         ttype = str(target.get("type") or "").strip()
-        if ttype == "student":
+        if ttype in ("student", "mentor"):
             return student_str in ids or student_str in whitelist
 
         if student_str in whitelist:
@@ -2341,6 +2384,32 @@ class AssessmentService:
         return out
 
     @staticmethod
+    def _refresh_stem_images(images: Optional[List[dict]]) -> Optional[List[dict]]:
+        """读取题目时，按 object_name 重新签一遍图片直链。
+
+        库里存的是导入/拆题那一刻签出的预签名 URL：签名跟「当时的 Host」绑定、而且有
+        有效期（7 天）。只要对外地址变过（例如 minio:9000 → localhost:9000）或链接过期，
+        图片就全部加载不出来。现签既纠正了 Host，也顺带续期。
+        （配了 region 之后签名是纯本地计算，没有网络往返，所以这里同步调用没问题。）
+        """
+        if not images:
+            return images
+        out: List[dict] = []
+        for image in images:
+            if not isinstance(image, dict):
+                out.append(image)
+                continue
+            item = dict(image)
+            object_name = item.get("object_name")
+            if object_name:
+                try:
+                    item["url"] = MinioService.get_download_url(object_name, 7 * 24 * 3600)
+                except Exception as e:
+                    logger.warning("Re-sign stem image %s failed: %s", object_name, e)
+            out.append(item)
+        return out
+
+    @staticmethod
     def _student_question_payload(question: AssessmentQuestion) -> Dict[str, Any]:
         """学生端题目。编程题只给语言和起始代码，测试用例一律不下发。"""
         return {
@@ -2348,7 +2417,7 @@ class AssessmentService:
             "order_index": question.order_index,
             "question_type": question.question_type,
             "stem": question.stem,
-            "stem_images": question.stem_images,
+            "stem_images": AssessmentService._refresh_stem_images(question.stem_images),
             "options": question.options,
             "score": question.score,
             "language": question.language,
@@ -2372,6 +2441,146 @@ class AssessmentService:
             return True
         target = AssessmentService._as_target_dict(paper.publish_target)
         return AssessmentService._coerce_require_fullscreen(target.get("require_fullscreen"))
+
+    QUESTION_TYPE_LABELS = {
+        "single": "单选题",
+        "multiple": "多选题",
+        "judge": "判断题",
+        "fill": "填空题",
+        "short": "简答题",
+        "essay": "论述题",
+        "code": "编程题",
+    }
+
+    @staticmethod
+    def _answer_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "、".join(str(item) for item in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    @staticmethod
+    def _is_wrong_answer(
+        question: AssessmentQuestion, answer: Optional[AssessmentAnswer]
+    ) -> bool:
+        """只认「判过并且确实没拿满」的题。
+
+        没批改的主观题不能算错 —— 还没判就说人家错是冤判；这也和后端其它统计
+        口径一致（未批改不按 0 分计）。
+        """
+        if answer is None or not answer.graded:
+            return False
+        if answer.is_correct is True:
+            return False
+        if answer.is_correct is False:
+            return True
+        if question.score is None:
+            return False
+        return float(answer.score or 0.0) < float(question.score)
+
+    @staticmethod
+    async def build_student_notebook(
+        db: AsyncSession,
+        paper_id: UUID,
+        student_id: UUID,
+        teacher_id: Optional[UUID] = None,
+        for_student: bool = False,
+    ) -> Dict[str, Any]:
+        """某个学生某张卷的错题本数据，供模板渲染。
+
+        for_student=True 走学生视角：只要求这张卷已发布且发给了该学生；
+        否则走教师视角，校验试卷归属（原教师端导出用这条）。
+        """
+        if for_student:
+            paper = await AssessmentService._get_published_paper_for_student(
+                db, paper_id, student_id
+            )
+        else:
+            paper = await AssessmentService.get_paper(db, paper_id, teacher_id)
+
+        user_res = await db.execute(
+            select(User, StudentProfile)
+            .outerjoin(StudentProfile, StudentProfile.user_id == User.id)
+            .where(User.id == student_id)
+        )
+        row = user_res.first()
+        user = row[0] if row else None
+        profile = row[1] if row else None
+
+        attempt = await AssessmentService._get_latest_attempt(db, paper_id, student_id)
+
+        question_res = await db.execute(
+            select(AssessmentQuestion)
+            .where(AssessmentQuestion.paper_id == paper_id)
+            .order_by(AssessmentQuestion.order_index.asc())
+        )
+        questions = list(question_res.scalars().all())
+
+        answers: Dict[Any, AssessmentAnswer] = {}
+        if attempt:
+            answer_res = await db.execute(
+                select(AssessmentAnswer).where(AssessmentAnswer.attempt_id == attempt.id)
+            )
+            answers = {item.question_id: item for item in answer_res.scalars().all()}
+
+        items: List[Dict[str, Any]] = []
+        for index, question in enumerate(questions, start=1):
+            answer = answers.get(question.id)
+            if not AssessmentService._is_wrong_answer(question, answer):
+                continue
+            items.append({
+                "index": index,
+                "question_id": str(question.id),
+                "type_label": AssessmentService.QUESTION_TYPE_LABELS.get(
+                    question.question_type, question.question_type
+                ),
+                "stem": question.stem,
+                "images": list(question.stem_images or []),
+                "my_answer": AssessmentService._answer_text(answer.answer if answer else None),
+                "correct_answer": AssessmentService._answer_text(question.answer),
+                "analysis": question.analysis or "",
+                "score": answer.score if answer else None,
+                "max_score": question.score,
+            })
+
+        return {
+            "meta": {
+                "title": paper.title,
+                "paper_id": str(paper_id),
+                "student_name": (user.nickname or user.username) if user else "未知学生",
+                "student_no": (profile.student_id if profile else "") or "",
+                "username": user.username if user else "",
+                "wrong_count": len(items),
+                "question_count": len(questions),
+                "attempt_id": str(attempt.id) if attempt else None,
+            },
+            "questions": items,
+        }
+
+    @staticmethod
+    async def update_grading_preference(
+        db: AsyncSession,
+        paper_id: UUID,
+        teacher_id: UUID,
+        grading_preference: Optional[Dict[str, Any]],
+    ) -> AssessmentPaper:
+        """发布之后调整批阅尺度。
+
+        只改这张卷的偏好设置：已保存的分数和 AI 建议分一概不动，新尺度只对之后
+        发起的预批生效。所以这里不需要（也不应该）去碰任何作答或批改数据。
+        """
+        paper = await AssessmentService.get_paper(db, paper_id, teacher_id)
+        paper.grading_preference = AssessmentService._normalize_grading_preference(
+            grading_preference
+        )
+        await db.commit()
+        await db.refresh(paper)
+        return paper
 
     @staticmethod
     async def code_dry_run(
@@ -2487,7 +2696,7 @@ class AssessmentService:
                     "order_index": question.order_index,
                     "question_type": question.question_type,
                     "stem": question.stem,
-                    "stem_images": question.stem_images,
+                    "stem_images": AssessmentService._refresh_stem_images(question.stem_images),
                     "options": AssessmentService._public_options(question.options),
                     "language": question.language,
                     "max_score": question.score,
@@ -2963,12 +3172,20 @@ class AssessmentService:
 
             logger.info("Parsing paper %s: downloading %s", paper_id, file.original_name)
             file_bytes = await asyncio.to_thread(MinioService.download_file, file.storage_path)
-            raw_text = parse_document(file_bytes, file.original_name)
+            # 文本与图片必须成对产出：图片位置以 [[IMG:n]] 写进文本，n 与图片列表下标一致。
+            # 旧实现分别调用 parse_document / extract_images，文本里没有占位符、图片又是按
+            # word/media/ 文件名排序，导致所有题的 stem_images 永远是空。
+            raw_text, extracted_images = await asyncio.to_thread(
+                parse_document_with_images, file_bytes, file.original_name
+            )
             if not raw_text.strip():
                 raise ValidationError("文档解析为空，无有效可提取文本")
-            logger.info("Parsing paper %s: extracted %d chars of text", paper_id, len(raw_text))
-
-            extracted_images = await asyncio.to_thread(extract_images, file_bytes, file.original_name)
+            logger.info(
+                "Parsing paper %s: extracted %d chars of text, %d image(s)",
+                paper_id,
+                len(raw_text),
+                len(extracted_images),
+            )
             doc_images: List[dict] = []
             for idx, im in enumerate(extracted_images, start=1):
                 ext = im.get("ext") or "png"
