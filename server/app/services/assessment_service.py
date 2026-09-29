@@ -2626,14 +2626,17 @@ class AssessmentService:
             raise NotFoundError("作答记录不存在")
         await AssessmentService.get_paper(db, attempt.paper_id, teacher_id)
 
+        # 用外连接取全卷题目：学生跳过没答的题也要列出来，否则教师看不到漏答，
+        # 也没法判断「整题空着」还是「答了但没存」。
         rows = (
             await db.execute(
-                select(AssessmentAnswer, AssessmentQuestion)
-                .join(AssessmentQuestion, AssessmentQuestion.id == AssessmentAnswer.question_id)
-                .where(
-                    AssessmentAnswer.attempt_id == attempt_id,
-                    AssessmentQuestion.paper_id == attempt.paper_id,
+                select(AssessmentQuestion, AssessmentAnswer)
+                .outerjoin(
+                    AssessmentAnswer,
+                    (AssessmentAnswer.question_id == AssessmentQuestion.id)
+                    & (AssessmentAnswer.attempt_id == attempt_id),
                 )
+                .where(AssessmentQuestion.paper_id == attempt.paper_id)
                 .order_by(AssessmentQuestion.order_index.asc())
             )
         ).all()
@@ -2646,10 +2649,10 @@ class AssessmentService:
                 "options": q.options,
                 "reference_answer": q.answer,
                 "max_score": q.score,
-                "answer": a.answer,
-                "score": a.score,
-                "graded": a.graded,
-                "is_correct": a.is_correct,
+                "answer": a.answer if a else None,
+                "score": a.score if a else None,
+                "graded": a.graded if a else False,
+                "is_correct": a.is_correct if a else None,
                 "language": q.language,
                 # 教师能看到隐藏用例的通过情况与输入输出：批改编程题必须能看到
                 # 「挂在哪个用例上」，只有通过数等于让教师盲批。
@@ -2659,15 +2662,15 @@ class AssessmentService:
                         "passed": (a.judge_result or {}).get("passed"),
                         "total": (a.judge_result or {}).get("total"),
                     }
-                    if a.judge_result
+                    if a and a.judge_result
                     else None
                 ),
-                "judge_detail": a.judge_result,
-                "ai_suggested_score": a.ai_suggested_score,
-                "ai_comment": a.ai_comment,
-                "ai_graded_at": a.ai_graded_at,
+                "judge_detail": a.judge_result if a else None,
+                "ai_suggested_score": a.ai_suggested_score if a else None,
+                "ai_comment": a.ai_comment if a else None,
+                "ai_graded_at": a.ai_graded_at if a else None,
             }
-            for a, q in rows
+            for q, a in rows
         ]
 
     @staticmethod
@@ -3020,16 +3023,33 @@ class AssessmentService:
 
             for q in questions:
                 score = AssessmentService._optional_score(q.get("score"))
+                question_type = q["question_type"]
+                # 编程题的附加字段只在 code 类型下保留，且必须与人工校对保存
+                # （save_questions）走同一套收敛逻辑：这里漏写会让 AI 拆出的编程题
+                # 丢掉语言与测试用例，落库后永远判不了分。
+                is_code = question_type == "code"
+                test_cases = (
+                    question_parser_module.normalize_test_cases(q.get("test_cases"))
+                    if is_code
+                    else None
+                )
                 db.add(
                     AssessmentQuestion(
                         paper_id=paper_id,
                         order_index=q["order_index"],
-                        question_type=q["question_type"],
+                        question_type=question_type,
                         stem=q["stem"],
                         stem_images=q.get("stem_images") or None,
                         options=question_parser_module.normalize_options(q.get("options")),
                         answer=q.get("answer"),
                         analysis=q.get("analysis"),
+                        language=(
+                            question_parser_module.normalize_code_language(q.get("language"))
+                            if is_code
+                            else None
+                        ),
+                        test_cases=test_cases or None,
+                        starter_code=(q.get("starter_code") or None) if is_code else None,
                         score=score,
                         difficulty=q.get("difficulty"),
                         tags=q.get("tags") or None,
